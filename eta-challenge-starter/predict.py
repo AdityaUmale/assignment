@@ -21,21 +21,13 @@ with open(_MODEL_PATH, "rb") as _f:
 if hasattr(_MODEL, "get_booster"):
     _MODEL.get_booster().feature_names = None
 
-# Feature order must match baseline.py:
-#   pickup_zone, dropoff_zone, hour, dow, month, passenger_count
+
+def _cyclical(value: int, period: int) -> tuple[float, float]:
+    angle = 2.0 * np.pi * value / period
+    return float(np.sin(angle)), float(np.cos(angle))
 
 
-def predict(request: dict) -> float:
-    """Predict trip duration in seconds.
-
-    Input schema:
-        {
-            "pickup_zone":     int,   # NYC taxi zone, 1-265
-            "dropoff_zone":    int,
-            "requested_at":    str,   # ISO 8601 datetime
-            "passenger_count": int,
-        }
-    """
+def _predict_xgboost_baseline(request: dict) -> float:
     ts = datetime.fromisoformat(request["requested_at"])
     x = np.array(
         [[
@@ -49,3 +41,99 @@ def predict(request: dict) -> float:
         dtype=np.int32,
     )
     return float(_MODEL.predict(x)[0])
+
+
+def _lookup_value(table: np.ndarray | None, pickup: int, dropoff: int, default: float) -> float:
+    if table is None or not (0 <= pickup < table.shape[0]) or not (0 <= dropoff < table.shape[1]):
+        return default
+    value = float(table[pickup, dropoff])
+    if not np.isfinite(value) or value <= 0:
+        return default
+    return value
+
+
+def _predict_route_artifact(request: dict) -> float:
+    ts = datetime.fromisoformat(request["requested_at"])
+    pickup = int(request["pickup_zone"])
+    dropoff = int(request["dropoff_zone"])
+    passenger_count = int(request["passenger_count"])
+
+    global_mean = float(_MODEL["global_mean"])
+    pair_value = _lookup_value(_MODEL["pair_value"], pickup, dropoff, global_mean)
+    pair_hour_value = _MODEL.get("pair_hour_value")
+    pair_dow_value = _MODEL.get("pair_dow_value")
+
+    if pair_hour_value is not None and 0 <= pickup < pair_hour_value.shape[0] and 0 <= dropoff < pair_hour_value.shape[1]:
+        pair_hour = float(pair_hour_value[pickup, dropoff, ts.hour])
+    else:
+        pair_hour = pair_value
+    if pair_dow_value is not None and 0 <= pickup < pair_dow_value.shape[0] and 0 <= dropoff < pair_dow_value.shape[1]:
+        pair_dow = float(pair_dow_value[pickup, dropoff, ts.weekday()])
+    else:
+        pair_dow = pair_value
+
+    if pair_hour_value is not None and pair_dow_value is not None:
+        base_prediction = 0.7 * pair_hour + 0.3 * pair_dow
+    elif pair_hour_value is not None:
+        base_prediction = pair_hour
+    elif pair_dow_value is not None:
+        base_prediction = pair_dow
+    else:
+        base_prediction = pair_value
+
+    residual_model = _MODEL.get("residual_model")
+    if residual_model is None:
+        return max(1.0, base_prediction)
+
+    pickup_values = _MODEL["pickup_value"]
+    dropoff_values = _MODEL["dropoff_value"]
+    pair_counts = _MODEL["pair_count"]
+
+    pickup_value = float(pickup_values[pickup]) if 0 <= pickup < len(pickup_values) else global_mean
+    dropoff_value = float(dropoff_values[dropoff]) if 0 <= dropoff < len(dropoff_values) else global_mean
+    pair_count = float(pair_counts[pickup, dropoff]) if 0 <= pickup < pair_counts.shape[0] and 0 <= dropoff < pair_counts.shape[1] else 0.0
+
+    hour_sin, hour_cos = _cyclical(ts.hour, 24)
+    dow_sin, dow_cos = _cyclical(ts.weekday(), 7)
+    is_weekend = 1.0 if ts.weekday() >= 5 else 0.0
+    is_rush = 1.0 if ts.weekday() < 5 and (7 <= ts.hour <= 9 or 16 <= ts.hour <= 18) else 0.0
+
+    x = np.array(
+        [[
+            pair_value,
+            pair_hour,
+            pair_dow,
+            np.log1p(pair_count),
+            pickup_value,
+            dropoff_value,
+            ts.hour,
+            ts.weekday(),
+            ts.month,
+            passenger_count,
+            is_weekend,
+            is_rush,
+            hour_sin,
+            hour_cos,
+            dow_sin,
+            dow_cos,
+        ]],
+        dtype=np.float32,
+    )
+    residual = float(residual_model.predict(x)[0])
+    return max(1.0, base_prediction + residual)
+
+
+def predict(request: dict) -> float:
+    """Predict trip duration in seconds.
+
+    Input schema:
+        {
+            "pickup_zone":     int,   # NYC taxi zone, 1-265
+            "dropoff_zone":    int,
+            "requested_at":    str,   # ISO 8601 datetime
+            "passenger_count": int,
+        }
+    """
+    if isinstance(_MODEL, dict) and _MODEL.get("artifact_type") == "route_model":
+        return _predict_route_artifact(request)
+    return _predict_xgboost_baseline(request)
