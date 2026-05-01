@@ -73,6 +73,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 def add_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     ts = pd.to_datetime(df["requested_at"])
     out = df.copy()
+    out["_ts"] = ts
     out["hour"] = ts.dt.hour.astype("int8")
     out["dow"] = ts.dt.dayofweek.astype("int8")
     out["month"] = ts.dt.month.astype("int8")
@@ -148,6 +149,21 @@ def make_artifact(
         "residual_model": residual_model,
         "features": FEATURE_COLUMNS,
     }
+
+
+def fixed_lookup_artifact(train: pd.DataFrame, notes: str = "") -> dict:
+    """Build the selected lookup recipe without consulting Dev labels."""
+    stats = group_arrays(train)
+    pair_value = smoothed_pair_table(stats, m=0.0, statistic="median")
+    pair_hour_value = smoothed_child_table(train, pair_value, "hour", m=25.0)
+    pair_dow_value = smoothed_child_table(train, pair_value, "dow", m=25.0)
+    return make_artifact(
+        stats,
+        pair_value,
+        pair_hour_value=pair_hour_value,
+        pair_dow_value=pair_dow_value,
+        notes=notes,
+    )
 
 
 def save_artifact(artifact: dict, path: Path = MODEL_PATH) -> None:
@@ -321,6 +337,49 @@ def design_matrix(
     return x, y, base_prediction.astype(np.float32)
 
 
+def fit_residual_model(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    base_train: np.ndarray,
+    final_artifact: dict,
+    dev: pd.DataFrame,
+    label: str,
+) -> tuple[dict, float]:
+    x_dev, y_dev, base_dev = design_matrix(dev, final_artifact)
+    y_residual = y_train - base_train
+
+    print(f"Training {label} residual XGBoost...")
+    t0 = time.time()
+    residual_model = xgb.XGBRegressor(
+        n_estimators=600,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:absoluteerror",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+    )
+    residual_model.fit(
+        x_train,
+        y_residual,
+        eval_set=[(x_dev, y_dev - base_dev)],
+        verbose=False,
+    )
+    print(f"  trained in {time.time() - t0:.0f}s")
+
+    residual_preds = residual_model.predict(x_dev)
+    preds = np.maximum(1.0, base_dev + residual_preds)
+    score = mae(preds, y_dev)
+    print(f"{label}_residual_xgb_full_dev_mae={score:.3f}")
+
+    artifact = dict(final_artifact)
+    artifact["residual_model"] = residual_model
+    artifact["notes"] = f"{label}_residual_xgb:mae={score:.3f}"
+    return artifact, score
+
+
 def train_residual_model(train: pd.DataFrame, dev: pd.DataFrame, lookup_artifact: dict) -> tuple[dict, float]:
     model_artifact = dict(lookup_artifact)
     if model_artifact.get("pair_hour_value") is None:
@@ -368,10 +427,101 @@ def train_residual_model(train: pd.DataFrame, dev: pd.DataFrame, lookup_artifact
     return model_artifact, score
 
 
+def train_time_holdout_residual(
+    train: pd.DataFrame,
+    dev: pd.DataFrame,
+    final_artifact: dict,
+    sample_n: int,
+) -> tuple[dict, float]:
+    cutoff = pd.Timestamp("2023-11-01")
+    encoder_train = train[train["_ts"] < cutoff]
+    residual_train = train[train["_ts"] >= cutoff]
+    print("\nTime-holdout clean residual setup:")
+    print(f"  encoder rows:  {len(encoder_train):,} (< {cutoff.date()})")
+    print(f"  residual rows: {len(residual_train):,} (>= {cutoff.date()})")
+
+    clean_train_artifact = fixed_lookup_artifact(encoder_train, notes="time_holdout_training_encodings")
+    x_train, y_train, base_train = design_matrix(residual_train, clean_train_artifact, sample_n=sample_n)
+    return fit_residual_model(x_train, y_train, base_train, final_artifact, dev, "time_holdout")
+
+
+def train_oof_residual(
+    train: pd.DataFrame,
+    dev: pd.DataFrame,
+    final_artifact: dict,
+    sample_n: int,
+    n_folds: int,
+) -> tuple[dict, float]:
+    print("\nK-fold OOF clean residual setup:")
+    sampled = train.sample(n=min(sample_n, len(train)), random_state=42)
+    sample_source_index = sampled.index.to_numpy(dtype=np.int64)
+    rng = np.random.default_rng(42)
+    folds = np.arange(len(sampled), dtype=np.int16) % n_folds
+    rng.shuffle(folds)
+
+    x_train = np.empty((len(sampled), len(FEATURE_COLUMNS)), dtype=np.float32)
+    y_train = np.empty(len(sampled), dtype=np.float32)
+    base_train = np.empty(len(sampled), dtype=np.float32)
+
+    for fold in range(n_folds):
+        fold_positions = np.flatnonzero(folds == fold)
+        fold_source_index = sample_source_index[fold_positions]
+        mask = np.ones(len(train), dtype=bool)
+        mask[fold_source_index] = False
+
+        print(f"  fold {fold + 1}/{n_folds}: encode on {int(mask.sum()):,}, assign {len(fold_positions):,}")
+        fold_artifact = fixed_lookup_artifact(train.loc[mask], notes=f"oof_fold_{fold}_training_encodings")
+        x_fold, y_fold, base_fold = design_matrix(sampled.iloc[fold_positions], fold_artifact)
+        x_train[fold_positions] = x_fold
+        y_train[fold_positions] = y_fold
+        base_train[fold_positions] = base_fold
+
+    return fit_residual_model(x_train, y_train, base_train, final_artifact, dev, "oof")
+
+
+def train_clean_residual_models(
+    train: pd.DataFrame,
+    dev: pd.DataFrame,
+    lookup_artifact: dict,
+    lookup_score: float,
+    sample_n: int,
+    n_folds: int,
+    mode: str,
+) -> tuple[dict, float]:
+    best_artifact = lookup_artifact
+    best_score = lookup_score
+    results: list[tuple[str, float]] = [("lookup", lookup_score)]
+
+    if mode in ("time", "both"):
+        time_artifact, time_score = train_time_holdout_residual(train, dev, lookup_artifact, sample_n)
+        results.append(("time_holdout", time_score))
+        if time_score < best_score:
+            best_artifact, best_score = time_artifact, time_score
+
+    if mode in ("oof", "both"):
+        oof_artifact, oof_score = train_oof_residual(train, dev, lookup_artifact, sample_n, n_folds)
+        results.append(("oof", oof_score))
+        if oof_score < best_score:
+            best_artifact, best_score = oof_artifact, oof_score
+
+    print("\nClean residual comparison:")
+    for name, score in results:
+        print(f"  {name}: {score:.3f}")
+    if best_artifact is lookup_artifact:
+        print("lookup remains best after leakage-safe residual comparison")
+    else:
+        print(f"best clean residual wins by {lookup_score - best_score:.3f}s")
+    return best_artifact, best_score
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-lookup", action="store_true", help="save the best lookup artifact and stop")
     parser.add_argument("--train-xgb", action="store_true", help="train residual XGBoost after lookup tuning")
+    parser.add_argument("--train-clean-xgb", action="store_true", help="compare leakage-safe time-holdout and OOF residual XGBoost")
+    parser.add_argument("--clean-mode", choices=["time", "oof", "both"], default="both", help="which leakage-safe residual setup to run")
+    parser.add_argument("--sample-n", type=int, default=5_000_000, help="residual training sample size")
+    parser.add_argument("--oof-folds", type=int, default=5, help="number of OOF folds")
     args = parser.parse_args()
 
     train, dev = load_data()
@@ -393,7 +543,18 @@ def main() -> None:
         else:
             print(f"lookup remains best by {xgb_score - lookup_score:.3f}s")
 
-    if args.save_lookup or args.train_xgb:
+    if args.train_clean_xgb:
+        best_artifact, best_score = train_clean_residual_models(
+            train,
+            dev,
+            lookup_artifact,
+            lookup_score,
+            sample_n=args.sample_n,
+            n_folds=args.oof_folds,
+            mode=args.clean_mode,
+        )
+
+    if args.save_lookup or args.train_xgb or args.train_clean_xgb:
         save_artifact(best_artifact)
         print(f"saved_best_full_dev_mae={best_score:.3f}")
 
