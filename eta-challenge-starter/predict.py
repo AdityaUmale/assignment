@@ -23,8 +23,9 @@ if hasattr(_MODEL, "get_booster"):
 
 
 def _cyclical(value: int, period: int) -> tuple[float, float]:
-    angle = 2.0 * np.pi * value / period
-    return float(np.sin(angle)), float(np.cos(angle))
+    arr = np.array([value], dtype=np.float32)
+    angle = 2.0 * np.pi * arr / period
+    return float(np.sin(angle)[0]), float(np.cos(angle)[0])
 
 
 def _predict_xgboost_baseline(request: dict) -> float:
@@ -69,12 +70,19 @@ def _distance_features(pickup: int, dropoff: int) -> list[float]:
     if not all(np.isfinite(v) for v in values):
         return [np.nan, np.nan, np.nan, np.nan, np.nan]
 
-    lat1 = np.radians(pickup_lat)
-    lat2 = np.radians(dropoff_lat)
-    dlat = lat2 - lat1
-    dlon = np.radians(dropoff_lon - pickup_lon)
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    haversine_miles = float(3958.7613 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
+    pickup_lat_arr = np.array([pickup_lat], dtype=np.float32)
+    pickup_lon_arr = np.array([pickup_lon], dtype=np.float32)
+    dropoff_lat_arr = np.array([dropoff_lat], dtype=np.float32)
+    dropoff_lon_arr = np.array([dropoff_lon], dtype=np.float32)
+
+    dlat = np.radians(dropoff_lat_arr - pickup_lat_arr)
+    dlon = np.radians(dropoff_lon_arr - pickup_lon_arr)
+    a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(np.radians(pickup_lat_arr)) * np.cos(np.radians(dropoff_lat_arr)) * np.sin(dlon / 2.0) ** 2
+    )
+    haversine_miles = (3958.7613 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))).astype(np.float32)
+    haversine_miles = float(haversine_miles[0])
     return [pickup_lat, pickup_lon, dropoff_lat, dropoff_lon, haversine_miles]
 
 
@@ -111,13 +119,13 @@ def _predict_route_artifact(request: dict) -> float:
         pair_dow = pair_value
 
     if pair_hour_value is not None and pair_dow_value is not None:
-        base_prediction = 0.7 * pair_hour + 0.3 * pair_dow
+        base_prediction = float(np.array([0.7 * pair_hour + 0.3 * pair_dow], dtype=np.float32)[0])
     elif pair_hour_value is not None:
-        base_prediction = pair_hour
+        base_prediction = float(np.array([pair_hour], dtype=np.float32)[0])
     elif pair_dow_value is not None:
-        base_prediction = pair_dow
+        base_prediction = float(np.array([pair_dow], dtype=np.float32)[0])
     else:
-        base_prediction = pair_value
+        base_prediction = float(np.array([pair_value], dtype=np.float32)[0])
 
     residual_model = _MODEL.get("residual_model")
     if residual_model is None:

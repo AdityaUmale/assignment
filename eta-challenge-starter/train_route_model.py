@@ -16,6 +16,7 @@ import argparse
 import pickle
 import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -355,14 +356,18 @@ def polygon_centroid(points: list[tuple[float, float]], parts: list[int]) -> tup
     return cx_total / total_area, cy_total / total_area
 
 
-def load_zone_centroids() -> tuple[np.ndarray, np.ndarray]:
-    """Return zone centroid lat/lon arrays; centroids are computed before CRS conversion."""
+def ensure_taxi_zones_extracted() -> None:
     if not TAXI_ZONES_SHP.exists():
         if not TAXI_ZONES_ZIP.exists():
             print(f"Downloading taxi zone shapefile from {TAXI_ZONES_URL}...")
             urlretrieve(TAXI_ZONES_URL, TAXI_ZONES_ZIP)
         with zipfile.ZipFile(TAXI_ZONES_ZIP) as zf:
             zf.extractall(DATA_DIR)
+
+
+def load_zone_centroids() -> tuple[np.ndarray, np.ndarray]:
+    """Return zone centroid lat/lon arrays; centroids are computed before CRS conversion."""
+    ensure_taxi_zones_extracted()
 
     try:
         import shapefile
@@ -396,6 +401,21 @@ def load_zone_centroids() -> tuple[np.ndarray, np.ndarray]:
     if len(missing):
         print(f"Centroid warning: missing {len(missing)} zone ids; distance features will fallback for them.")
     return zone_lat, zone_lon
+
+
+def load_zone_boroughs() -> dict[int, str]:
+    """Load TLC borough labels for diagnostics only."""
+    ensure_taxi_zones_extracted()
+    try:
+        import shapefile
+    except ImportError:
+        return {}
+
+    reader = shapefile.Reader(str(TAXI_ZONES_SHP))
+    fields = [field[0] for field in reader.fields[1:]]
+    location_idx = fields.index("LocationID")
+    borough_idx = fields.index("borough")
+    return {int(record[location_idx]): str(record[borough_idx]) for record in reader.records()}
 
 
 def bearing_radians(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
@@ -577,6 +597,7 @@ def predict_artifact(df: pd.DataFrame, artifact: dict) -> np.ndarray:
 
 
 def evaluate_artifact_splits(dev: pd.DataFrame, artifact: dict, label: str) -> dict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]]:
+    # Dev holdout is report-only. Use dev_tune for future feature keep/drop decisions.
     splits = {
         "dev_tune": dev[dev["_ts"] < pd.Timestamp("2023-12-29")],
         "dev_holdout": dev[dev["_ts"] >= pd.Timestamp("2023-12-29")],
@@ -597,6 +618,29 @@ def evaluate_artifact_splits(dev: pd.DataFrame, artifact: dict, label: str) -> d
         )
         results[split_name] = (preds, truth, split_df)
     return results
+
+
+def print_zone_subset_mae(results: dict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]]) -> None:
+    boroughs = load_zone_boroughs()
+    manhattan_zones = {zone for zone, borough in boroughs.items() if borough == "Manhattan"}
+    outer_zones = {zone for zone, borough in boroughs.items() if borough in {"Bronx", "Brooklyn", "Queens", "Staten Island", "EWR"}}
+    subsets: dict[str, Callable[[pd.DataFrame], pd.Series]] = {
+        "airports_1_132_138": lambda df: df["pickup_zone"].isin([1, 132, 138]) | df["dropoff_zone"].isin([1, 132, 138]),
+        "unknown_264_265": lambda df: df["pickup_zone"].isin([264, 265]) | df["dropoff_zone"].isin([264, 265]),
+        "manhattan": lambda df: df["pickup_zone"].isin(manhattan_zones) | df["dropoff_zone"].isin(manhattan_zones),
+        "outer_boroughs": lambda df: df["pickup_zone"].isin(outer_zones) | df["dropoff_zone"].isin(outer_zones),
+    }
+
+    print("\nZone-subset MAE diagnostics:")
+    for split_name, (preds, truth, split_df) in results.items():
+        print(f"  {split_name}:")
+        abs_err = np.abs(preds - truth)
+        for subset_name, mask_fn in subsets.items():
+            mask = mask_fn(split_df).to_numpy()
+            if not mask.any():
+                print(f"    {subset_name}: rows=0")
+                continue
+            print(f"    {subset_name}: rows={int(mask.sum()):,} mae={float(abs_err[mask].mean()):.3f}")
 
 
 def print_zone_delta_diagnostics(
@@ -637,6 +681,31 @@ def print_zone_delta_diagnostics(
 def load_artifact(path: Path) -> dict:
     with open(path, "rb") as f:
         return pickle.load(f)
+
+
+def profile_predict_latency(dev: pd.DataFrame, calls: int = 10_000, warmup: int = 200) -> None:
+    from predict import predict
+
+    records = dev[["pickup_zone", "dropoff_zone", "requested_at", "passenger_count"]].sample(
+        n=min(calls + warmup, len(dev)),
+        random_state=42,
+    ).to_dict("records")
+
+    for req in records[:warmup]:
+        predict(req)
+
+    timings = np.empty(min(calls, len(records) - warmup), dtype=np.float64)
+    for i, req in enumerate(records[warmup: warmup + len(timings)]):
+        t0 = time.perf_counter()
+        predict(req)
+        timings[i] = (time.perf_counter() - t0) * 1000.0
+
+    p50, p95, p99 = np.percentile(timings, [50, 95, 99])
+    print("\nPredict latency profile:")
+    print(f"  calls={len(timings):,} warmup={warmup:,}")
+    print(f"  p50_ms={p50:.3f} p95_ms={p95:.3f} p99_ms={p99:.3f}")
+    if p99 >= 200.0:
+        raise SystemExit(f"p99 latency {p99:.3f}ms exceeds the 200ms/request constraint")
 
 
 def train_residual_model(train: pd.DataFrame, dev: pd.DataFrame, lookup_artifact: dict) -> tuple[dict, float]:
@@ -810,6 +879,7 @@ def main() -> None:
     parser.add_argument("--bearing", action="store_true", help="add bearing sin/cos features; implies --distance")
     parser.add_argument("--eval-artifact", type=Path, help="evaluate an artifact on full Dev plus tune/holdout splits")
     parser.add_argument("--compare-artifact", type=Path, help="baseline artifact to compare against --eval-artifact")
+    parser.add_argument("--profile-latency", action="store_true", help="profile predict() p50/p95/p99 latency on Dev requests")
     args = parser.parse_args()
 
     train, dev = load_data()
@@ -819,10 +889,15 @@ def main() -> None:
     if args.eval_artifact:
         candidate = load_artifact(args.eval_artifact)
         candidate_results = evaluate_artifact_splits(dev, candidate, args.eval_artifact.name)
+        print_zone_subset_mae(candidate_results)
         if args.compare_artifact:
             baseline = load_artifact(args.compare_artifact)
             baseline_results = evaluate_artifact_splits(dev, baseline, args.compare_artifact.name)
             print_zone_delta_diagnostics(baseline_results, candidate_results)
+        return
+
+    if args.profile_latency:
+        profile_predict_latency(dev)
         return
 
     lookup_artifact, _ = evaluate_lookup(train, dev)
