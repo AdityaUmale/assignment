@@ -39,7 +39,7 @@ Where it fell short:
 - It was useful for review, but I still had to decide what evidence was strong
   enough to keep or drop an experiment.
 
-Total time spent on this challenge: 2 hours 
+Total time spent on this challenge: 4 hours 
 
 ## Final Score
 
