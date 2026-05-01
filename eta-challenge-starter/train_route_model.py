@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import pickle
 import time
+import zipfile
 from pathlib import Path
+from urllib.request import urlretrieve
 
 import numpy as np
 import pandas as pd
@@ -24,7 +26,12 @@ import xgboost as xgb
 DATA_DIR = Path(__file__).parent / "data"
 MODEL_PATH = Path(__file__).parent / "model.pkl"
 ZONE_COUNT = 266
-FEATURE_COLUMNS = [
+TAXI_ZONES_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip"
+TAXI_ZONES_ZIP = DATA_DIR / "taxi_zones.zip"
+TAXI_ZONES_DIR = DATA_DIR / "taxi_zones"
+TAXI_ZONES_SHP = TAXI_ZONES_DIR / "taxi_zones.shp"
+
+BASE_FEATURE_COLUMNS = [
     "pair_value",
     "pair_hour",
     "pair_dow",
@@ -42,6 +49,26 @@ FEATURE_COLUMNS = [
     "dow_sin",
     "dow_cos",
 ]
+DISTANCE_FEATURE_COLUMNS = [
+    "pickup_lat",
+    "pickup_lon",
+    "dropoff_lat",
+    "dropoff_lon",
+    "haversine_miles",
+]
+BEARING_FEATURE_COLUMNS = [
+    "bearing_sin",
+    "bearing_cos",
+]
+
+
+def feature_columns(use_distance: bool = False, use_bearing: bool = False) -> list[str]:
+    columns = list(BASE_FEATURE_COLUMNS)
+    if use_distance:
+        columns.extend(DISTANCE_FEATURE_COLUMNS)
+    if use_bearing:
+        columns.extend(BEARING_FEATURE_COLUMNS)
+    return columns
 
 
 def mae(preds: np.ndarray, truth: np.ndarray) -> float:
@@ -133,6 +160,10 @@ def make_artifact(
     residual_model: xgb.XGBRegressor | None = None,
     pair_hour_value: np.ndarray | None = None,
     pair_dow_value: np.ndarray | None = None,
+    zone_lat: np.ndarray | None = None,
+    zone_lon: np.ndarray | None = None,
+    use_distance: bool = False,
+    use_bearing: bool = False,
     notes: str = "",
 ) -> dict:
     return {
@@ -146,12 +177,23 @@ def make_artifact(
         "dropoff_value": stats["dropoff_value"].astype(np.float32),
         "pair_hour_value": None if pair_hour_value is None else pair_hour_value.astype(np.float32),
         "pair_dow_value": None if pair_dow_value is None else pair_dow_value.astype(np.float32),
+        "zone_lat": None if zone_lat is None else zone_lat.astype(np.float32),
+        "zone_lon": None if zone_lon is None else zone_lon.astype(np.float32),
+        "use_distance": bool(use_distance),
+        "use_bearing": bool(use_bearing),
         "residual_model": residual_model,
-        "features": FEATURE_COLUMNS,
+        "features": feature_columns(use_distance, use_bearing),
     }
 
 
-def fixed_lookup_artifact(train: pd.DataFrame, notes: str = "") -> dict:
+def fixed_lookup_artifact(
+    train: pd.DataFrame,
+    notes: str = "",
+    zone_lat: np.ndarray | None = None,
+    zone_lon: np.ndarray | None = None,
+    use_distance: bool = False,
+    use_bearing: bool = False,
+) -> dict:
     """Build the selected lookup recipe without consulting Dev labels."""
     stats = group_arrays(train)
     pair_value = smoothed_pair_table(stats, m=0.0, statistic="median")
@@ -162,6 +204,10 @@ def fixed_lookup_artifact(train: pd.DataFrame, notes: str = "") -> dict:
         pair_value,
         pair_hour_value=pair_hour_value,
         pair_dow_value=pair_dow_value,
+        zone_lat=zone_lat,
+        zone_lon=zone_lon,
+        use_distance=use_distance,
+        use_bearing=use_bearing,
         notes=notes,
     )
 
@@ -275,6 +321,141 @@ def smoothed_child_table(
     return table
 
 
+def polygon_centroid(points: list[tuple[float, float]], parts: list[int]) -> tuple[float, float]:
+    """Centroid in the shapefile's projected CRS, supporting multipart rings."""
+    total_area = 0.0
+    cx_total = 0.0
+    cy_total = 0.0
+    part_starts = list(parts) + [len(points)]
+
+    for start, end in zip(part_starts[:-1], part_starts[1:]):
+        ring = points[start:end]
+        if len(ring) < 3:
+            continue
+        area2 = 0.0
+        cx = 0.0
+        cy = 0.0
+        for i, (x0, y0) in enumerate(ring):
+            x1, y1 = ring[(i + 1) % len(ring)]
+            cross = x0 * y1 - x1 * y0
+            area2 += cross
+            cx += (x0 + x1) * cross
+            cy += (y0 + y1) * cross
+        if abs(area2) < 1e-9:
+            continue
+        area = area2 / 2.0
+        total_area += area
+        cx_total += cx / 6.0
+        cy_total += cy / 6.0
+
+    if abs(total_area) < 1e-9:
+        xs = np.array([p[0] for p in points], dtype=np.float64)
+        ys = np.array([p[1] for p in points], dtype=np.float64)
+        return float(xs.mean()), float(ys.mean())
+    return cx_total / total_area, cy_total / total_area
+
+
+def load_zone_centroids() -> tuple[np.ndarray, np.ndarray]:
+    """Return zone centroid lat/lon arrays; centroids are computed before CRS conversion."""
+    if not TAXI_ZONES_SHP.exists():
+        if not TAXI_ZONES_ZIP.exists():
+            print(f"Downloading taxi zone shapefile from {TAXI_ZONES_URL}...")
+            urlretrieve(TAXI_ZONES_URL, TAXI_ZONES_ZIP)
+        with zipfile.ZipFile(TAXI_ZONES_ZIP) as zf:
+            zf.extractall(DATA_DIR)
+
+    try:
+        import shapefile
+        from pyproj import CRS, Transformer
+    except ImportError as exc:
+        raise SystemExit(
+            "Centroid extraction needs training-only packages `pyshp` and `pyproj`: "
+            "`.venv/bin/python -m pip install pyshp pyproj`"
+        ) from exc
+
+    reader = shapefile.Reader(str(TAXI_ZONES_SHP))
+    fields = [field[0] for field in reader.fields[1:]]
+    location_idx = fields.index("LocationID")
+
+    source_crs = CRS.from_wkt((TAXI_ZONES_DIR / "taxi_zones.prj").read_text())
+    transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+
+    zone_lat = np.full(ZONE_COUNT, np.nan, dtype=np.float32)
+    zone_lon = np.full(ZONE_COUNT, np.nan, dtype=np.float32)
+
+    for shape_record in reader.iterShapeRecords():
+        location_id = int(shape_record.record[location_idx])
+        if not 0 <= location_id < ZONE_COUNT:
+            continue
+        cx, cy = polygon_centroid(shape_record.shape.points, list(shape_record.shape.parts))
+        lon, lat = transformer.transform(cx, cy)
+        zone_lat[location_id] = lat
+        zone_lon[location_id] = lon
+
+    missing = np.flatnonzero(~np.isfinite(zone_lat) | ~np.isfinite(zone_lon))
+    if len(missing):
+        print(f"Centroid warning: missing {len(missing)} zone ids; distance features will fallback for them.")
+    return zone_lat, zone_lon
+
+
+def bearing_radians(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    dlon = np.radians(lon2 - lon1)
+    y = np.sin(dlon) * np.cos(lat2_rad)
+    x = np.cos(lat1_rad) * np.sin(lat2_rad) - np.sin(lat1_rad) * np.cos(lat2_rad) * np.cos(dlon)
+    return np.arctan2(y, x)
+
+
+def distance_feature_matrix(
+    pickup: np.ndarray,
+    dropoff: np.ndarray,
+    artifact: dict,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    zone_lat = artifact.get("zone_lat")
+    zone_lon = artifact.get("zone_lon")
+    if zone_lat is None or zone_lon is None:
+        raise ValueError("Distance features requested without centroid arrays in artifact.")
+
+    pickup_lat = zone_lat[pickup].astype(np.float32)
+    pickup_lon = zone_lon[pickup].astype(np.float32)
+    dropoff_lat = zone_lat[dropoff].astype(np.float32)
+    dropoff_lon = zone_lon[dropoff].astype(np.float32)
+
+    valid = np.isfinite(pickup_lat) & np.isfinite(pickup_lon) & np.isfinite(dropoff_lat) & np.isfinite(dropoff_lon)
+    lat1 = np.where(valid, pickup_lat, 0.0)
+    lon1 = np.where(valid, pickup_lon, 0.0)
+    lat2 = np.where(valid, dropoff_lat, 0.0)
+    lon2 = np.where(valid, dropoff_lon, 0.0)
+
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2.0) ** 2
+    haversine_miles = (3958.7613 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))).astype(np.float32)
+    haversine_miles = np.where(valid, haversine_miles, np.nan).astype(np.float32)
+
+    distance_features = np.column_stack(
+        [
+            np.where(valid, pickup_lat, np.nan),
+            np.where(valid, pickup_lon, np.nan),
+            np.where(valid, dropoff_lat, np.nan),
+            np.where(valid, dropoff_lon, np.nan),
+            haversine_miles,
+        ]
+    ).astype(np.float32)
+
+    bearing_features = None
+    if artifact.get("use_bearing"):
+        bearing = bearing_radians(lat1, lon1, lat2, lon2)
+        bearing_features = np.column_stack(
+            [
+                np.where(valid, np.sin(bearing), np.nan),
+                np.where(valid, np.cos(bearing), np.nan),
+            ]
+        ).astype(np.float32)
+    return distance_features, bearing_features
+
+
 def design_matrix(
     df: pd.DataFrame,
     artifact: dict,
@@ -313,26 +494,32 @@ def design_matrix(
     is_weekend = (dow >= 5).astype(np.float32)
     is_rush = ((dow < 5) & (((hour >= 7) & (hour <= 9)) | ((hour >= 16) & (hour <= 18)))).astype(np.float32)
 
-    x = np.column_stack(
-        [
-            pair_value,
-            pair_hour,
-            pair_dow,
-            np.log1p(pair_count),
-            pickup_value,
-            dropoff_value,
-            hour,
-            dow,
-            month,
-            passenger_count,
-            is_weekend,
-            is_rush,
-            np.sin(hour_angle),
-            np.cos(hour_angle),
-            np.sin(dow_angle),
-            np.cos(dow_angle),
-        ]
-    ).astype(np.float32)
+    columns = [
+        pair_value,
+        pair_hour,
+        pair_dow,
+        np.log1p(pair_count),
+        pickup_value,
+        dropoff_value,
+        hour,
+        dow,
+        month,
+        passenger_count,
+        is_weekend,
+        is_rush,
+        np.sin(hour_angle),
+        np.cos(hour_angle),
+        np.sin(dow_angle),
+        np.cos(dow_angle),
+    ]
+
+    if artifact.get("use_distance"):
+        distance_features, bearing_features = distance_feature_matrix(pickup, dropoff, artifact)
+        columns.extend(distance_features.T)
+        if artifact.get("use_bearing"):
+            columns.extend(bearing_features.T)
+
+    x = np.column_stack(columns).astype(np.float32)
     y = df["duration_seconds"].to_numpy(dtype=np.float32)
     return x, y, base_prediction.astype(np.float32)
 
@@ -378,6 +565,78 @@ def fit_residual_model(
     artifact["residual_model"] = residual_model
     artifact["notes"] = f"{label}_residual_xgb:mae={score:.3f}"
     return artifact, score
+
+
+def predict_artifact(df: pd.DataFrame, artifact: dict) -> np.ndarray:
+    x, _, base = design_matrix(df, artifact)
+    residual_model = artifact.get("residual_model")
+    if residual_model is None:
+        return np.maximum(1.0, base.astype(np.float64))
+    residual = residual_model.predict(x).astype(np.float64)
+    return np.maximum(1.0, base.astype(np.float64) + residual)
+
+
+def evaluate_artifact_splits(dev: pd.DataFrame, artifact: dict, label: str) -> dict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]]:
+    splits = {
+        "dev_tune": dev[dev["_ts"] < pd.Timestamp("2023-12-29")],
+        "dev_holdout": dev[dev["_ts"] >= pd.Timestamp("2023-12-29")],
+        "full_dev": dev,
+    }
+    results = {}
+    print(f"\nArtifact evaluation: {label}")
+    print(f"  notes: {artifact.get('notes')}")
+    print(f"  features: {artifact.get('features')}")
+    for split_name, split_df in splits.items():
+        preds = predict_artifact(split_df, artifact)
+        truth = split_df["duration_seconds"].to_numpy(dtype=np.float64)
+        score = mae(preds, truth)
+        unknown_mask = split_df["pickup_zone"].isin([264, 265]) | split_df["dropoff_zone"].isin([264, 265])
+        print(
+            f"  {split_name}: mae={score:.3f} rows={len(split_df):,} "
+            f"unknown_zone_rows={int(unknown_mask.sum()):,} ({unknown_mask.mean() * 100:.3f}%)"
+        )
+        results[split_name] = (preds, truth, split_df)
+    return results
+
+
+def print_zone_delta_diagnostics(
+    baseline_results: dict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]],
+    candidate_results: dict[str, tuple[np.ndarray, np.ndarray, pd.DataFrame]],
+    split_name: str = "full_dev",
+    min_rows: int = 500,
+    top_n: int = 10,
+) -> None:
+    base_preds, truth, split_df = baseline_results[split_name]
+    cand_preds, _, _ = candidate_results[split_name]
+    diag = pd.DataFrame(
+        {
+            "pickup_zone": split_df["pickup_zone"].to_numpy(),
+            "base_abs": np.abs(base_preds - truth),
+            "cand_abs": np.abs(cand_preds - truth),
+        }
+    )
+    grouped = diag.groupby("pickup_zone").agg(
+        rows=("pickup_zone", "size"),
+        base_mae=("base_abs", "mean"),
+        cand_mae=("cand_abs", "mean"),
+    )
+    grouped["delta"] = grouped["cand_mae"] - grouped["base_mae"]
+    grouped = grouped[grouped["rows"] >= min_rows]
+
+    improved = grouped.sort_values("delta").head(top_n)
+    degraded = grouped.sort_values("delta", ascending=False).head(top_n)
+    print(f"\nPickup-zone delta diagnostics on {split_name} (candidate - baseline, rows >= {min_rows}):")
+    print("  Most improved:")
+    for zone, row in improved.iterrows():
+        print(f"    zone={int(zone):3d} rows={int(row.rows):6d} delta={row.delta:8.3f} cand={row.cand_mae:8.3f} base={row.base_mae:8.3f}")
+    print("  Most degraded:")
+    for zone, row in degraded.iterrows():
+        print(f"    zone={int(zone):3d} rows={int(row.rows):6d} delta={row.delta:8.3f} cand={row.cand_mae:8.3f} base={row.base_mae:8.3f}")
+
+
+def load_artifact(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def train_residual_model(train: pd.DataFrame, dev: pd.DataFrame, lookup_artifact: dict) -> tuple[dict, float]:
@@ -440,7 +699,14 @@ def train_time_holdout_residual(
     print(f"  encoder rows:  {len(encoder_train):,} (< {cutoff.date()})")
     print(f"  residual rows: {len(residual_train):,} (>= {cutoff.date()})")
 
-    clean_train_artifact = fixed_lookup_artifact(encoder_train, notes="time_holdout_training_encodings")
+    clean_train_artifact = fixed_lookup_artifact(
+        encoder_train,
+        notes="time_holdout_training_encodings",
+        zone_lat=final_artifact.get("zone_lat"),
+        zone_lon=final_artifact.get("zone_lon"),
+        use_distance=bool(final_artifact.get("use_distance")),
+        use_bearing=bool(final_artifact.get("use_bearing")),
+    )
     x_train, y_train, base_train = design_matrix(residual_train, clean_train_artifact, sample_n=sample_n)
     return fit_residual_model(x_train, y_train, base_train, final_artifact, dev, "time_holdout")
 
@@ -459,7 +725,7 @@ def train_oof_residual(
     folds = np.arange(len(sampled), dtype=np.int16) % n_folds
     rng.shuffle(folds)
 
-    x_train = np.empty((len(sampled), len(FEATURE_COLUMNS)), dtype=np.float32)
+    x_train = np.empty((len(sampled), len(final_artifact["features"])), dtype=np.float32)
     y_train = np.empty(len(sampled), dtype=np.float32)
     base_train = np.empty(len(sampled), dtype=np.float32)
 
@@ -470,7 +736,14 @@ def train_oof_residual(
         mask[fold_source_index] = False
 
         print(f"  fold {fold + 1}/{n_folds}: encode on {int(mask.sum()):,}, assign {len(fold_positions):,}")
-        fold_artifact = fixed_lookup_artifact(train.loc[mask], notes=f"oof_fold_{fold}_training_encodings")
+        fold_artifact = fixed_lookup_artifact(
+            train.loc[mask],
+            notes=f"oof_fold_{fold}_training_encodings",
+            zone_lat=final_artifact.get("zone_lat"),
+            zone_lon=final_artifact.get("zone_lon"),
+            use_distance=bool(final_artifact.get("use_distance")),
+            use_bearing=bool(final_artifact.get("use_bearing")),
+        )
         x_fold, y_fold, base_fold = design_matrix(sampled.iloc[fold_positions], fold_artifact)
         x_train[fold_positions] = x_fold
         y_train[fold_positions] = y_fold
@@ -487,7 +760,18 @@ def train_clean_residual_models(
     sample_n: int,
     n_folds: int,
     mode: str,
+    use_distance: bool = False,
+    use_bearing: bool = False,
 ) -> tuple[dict, float]:
+    if use_distance:
+        zone_lat, zone_lon = load_zone_centroids()
+        lookup_artifact = dict(lookup_artifact)
+        lookup_artifact["zone_lat"] = zone_lat
+        lookup_artifact["zone_lon"] = zone_lon
+        lookup_artifact["use_distance"] = True
+        lookup_artifact["use_bearing"] = bool(use_bearing)
+        lookup_artifact["features"] = feature_columns(True, use_bearing)
+
     best_artifact = lookup_artifact
     best_score = lookup_score
     results: list[tuple[str, float]] = [("lookup", lookup_score)]
@@ -522,11 +806,24 @@ def main() -> None:
     parser.add_argument("--clean-mode", choices=["time", "oof", "both"], default="both", help="which leakage-safe residual setup to run")
     parser.add_argument("--sample-n", type=int, default=5_000_000, help="residual training sample size")
     parser.add_argument("--oof-folds", type=int, default=5, help="number of OOF folds")
+    parser.add_argument("--distance", action="store_true", help="add centroid lat/lon and haversine distance features")
+    parser.add_argument("--bearing", action="store_true", help="add bearing sin/cos features; implies --distance")
+    parser.add_argument("--eval-artifact", type=Path, help="evaluate an artifact on full Dev plus tune/holdout splits")
+    parser.add_argument("--compare-artifact", type=Path, help="baseline artifact to compare against --eval-artifact")
     args = parser.parse_args()
 
     train, dev = load_data()
     train = add_time_columns(train)
     dev = add_time_columns(dev)
+
+    if args.eval_artifact:
+        candidate = load_artifact(args.eval_artifact)
+        candidate_results = evaluate_artifact_splits(dev, candidate, args.eval_artifact.name)
+        if args.compare_artifact:
+            baseline = load_artifact(args.compare_artifact)
+            baseline_results = evaluate_artifact_splits(dev, baseline, args.compare_artifact.name)
+            print_zone_delta_diagnostics(baseline_results, candidate_results)
+        return
 
     lookup_artifact, _ = evaluate_lookup(train, dev)
     lookup_score = float(lookup_artifact["notes"].rsplit("=", 1)[-1])
@@ -552,6 +849,8 @@ def main() -> None:
             sample_n=args.sample_n,
             n_folds=args.oof_folds,
             mode=args.clean_mode,
+            use_distance=args.distance or args.bearing,
+            use_bearing=args.bearing,
         )
 
     if args.save_lookup or args.train_xgb or args.train_clean_xgb:

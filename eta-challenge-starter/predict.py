@@ -52,6 +52,44 @@ def _lookup_value(table: np.ndarray | None, pickup: int, dropoff: int, default: 
     return value
 
 
+def _distance_features(pickup: int, dropoff: int) -> list[float]:
+    zone_lat = _MODEL.get("zone_lat")
+    zone_lon = _MODEL.get("zone_lon")
+    if zone_lat is None or zone_lon is None:
+        return [np.nan, np.nan, np.nan, np.nan, np.nan]
+
+    if not (0 <= pickup < len(zone_lat)) or not (0 <= dropoff < len(zone_lat)):
+        return [np.nan, np.nan, np.nan, np.nan, np.nan]
+
+    pickup_lat = float(zone_lat[pickup])
+    pickup_lon = float(zone_lon[pickup])
+    dropoff_lat = float(zone_lat[dropoff])
+    dropoff_lon = float(zone_lon[dropoff])
+    values = [pickup_lat, pickup_lon, dropoff_lat, dropoff_lon]
+    if not all(np.isfinite(v) for v in values):
+        return [np.nan, np.nan, np.nan, np.nan, np.nan]
+
+    lat1 = np.radians(pickup_lat)
+    lat2 = np.radians(dropoff_lat)
+    dlat = lat2 - lat1
+    dlon = np.radians(dropoff_lon - pickup_lon)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    haversine_miles = float(3958.7613 * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
+    return [pickup_lat, pickup_lon, dropoff_lat, dropoff_lon, haversine_miles]
+
+
+def _bearing_features(pickup_lat: float, pickup_lon: float, dropoff_lat: float, dropoff_lon: float) -> list[float]:
+    if not all(np.isfinite(v) for v in [pickup_lat, pickup_lon, dropoff_lat, dropoff_lon]):
+        return [np.nan, np.nan]
+    lat1 = np.radians(pickup_lat)
+    lat2 = np.radians(dropoff_lat)
+    dlon = np.radians(dropoff_lon - pickup_lon)
+    y = np.sin(dlon) * np.cos(lat2)
+    x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
+    bearing = np.arctan2(y, x)
+    return [float(np.sin(bearing)), float(np.cos(bearing))]
+
+
 def _predict_route_artifact(request: dict) -> float:
     ts = datetime.fromisoformat(request["requested_at"])
     pickup = int(request["pickup_zone"])
@@ -98,27 +136,31 @@ def _predict_route_artifact(request: dict) -> float:
     is_weekend = 1.0 if ts.weekday() >= 5 else 0.0
     is_rush = 1.0 if ts.weekday() < 5 and (7 <= ts.hour <= 9 or 16 <= ts.hour <= 18) else 0.0
 
-    x = np.array(
-        [[
-            pair_value,
-            pair_hour,
-            pair_dow,
-            np.log1p(pair_count),
-            pickup_value,
-            dropoff_value,
-            ts.hour,
-            ts.weekday(),
-            ts.month,
-            passenger_count,
-            is_weekend,
-            is_rush,
-            hour_sin,
-            hour_cos,
-            dow_sin,
-            dow_cos,
-        ]],
-        dtype=np.float32,
-    )
+    features = [
+        pair_value,
+        pair_hour,
+        pair_dow,
+        np.log1p(pair_count),
+        pickup_value,
+        dropoff_value,
+        ts.hour,
+        ts.weekday(),
+        ts.month,
+        passenger_count,
+        is_weekend,
+        is_rush,
+        hour_sin,
+        hour_cos,
+        dow_sin,
+        dow_cos,
+    ]
+    if _MODEL.get("use_distance"):
+        distance_features = _distance_features(pickup, dropoff)
+        features.extend(distance_features)
+        if _MODEL.get("use_bearing"):
+            features.extend(_bearing_features(*distance_features[:4]))
+
+    x = np.array([features], dtype=np.float32)
     residual = float(residual_model.predict(x)[0])
     return max(1.0, base_prediction + residual)
 

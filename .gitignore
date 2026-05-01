@@ -10,6 +10,9 @@ crossing-challenge-grader/
 # --- Test/calibration scratch ---
 mock_submission/
 mock_eta/
+eta-challenge-starter/data/taxi_zones.zip
+eta-challenge-starter/data/taxi_zones/
+eta-challenge-starter/data/preds.csv
 
 # --- Standard cruft ---
 .DS_Store
