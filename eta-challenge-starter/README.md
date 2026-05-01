@@ -1,220 +1,198 @@
-# The ETA Challenge
+# ETA Challenge Submission
 
-*A Gobblecube take-home: build the ride-hailing ETA engine.*
+This is my submission for the Gobblecube ETA challenge. The task is to predict
+NYC taxi trip duration from only four request-time fields:
 
----
+- pickup zone
+- dropoff zone
+- request time
+- passenger count
 
-## The Problem
+The final model is a time-aware route lookup plus a small residual XGBoost
+model. The main idea was simple: for this problem, the pickup/dropoff pair is
+much more informative than treating zone IDs as normal numbers.
 
-You've just joined the forecasting team at a ride-hailing company.
+## How I Worked
 
-Every time a rider opens the app, they see an ETA: *"Your driver arrives in 4 minutes. Trip takes 18 minutes."* That number is the difference between a happy rider and a cancelled trip. It's the difference between a driver earning and a driver idling. Every second of prediction error, at scale, costs real money.
+I am primarily a full-stack developer, and I had not worked on this kind of
+ETA/modeling problem before. I approached it as a problem to figure out step by
+step rather than as something where I already knew the right ML recipe.
 
-Your job: given a ride request and a year of historical trips, predict the ride duration as accurately as you can.
+I used AI tools heavily, but mostly as a pair-programming and review loop. I
+used Codex and opencode. My workflow was usually:
+use one llm model to help implement or run an experiment, then ask the other to
+review the reasoning, criticize the methodology, and point out risks before I
+moved on.
 
-This is a problem real companies pay serious money to solve. We want to see how you approach it.
+Where AI helped most:
 
----
+- Debugging methodology, especially target-encoding leakage and Dev overfitting
+  risk.
+- Reviewing the training/inference boundary, which led to the
+  predict-vs-training equivalence test.
+- Turning experiment ideas into small implementation steps I could measure.
 
-## What You Ship
+Where it fell short:
 
-A Python function:
+- It sometimes pushed for more features before the validation setup was strong
+  enough.
+- It was useful for review, but I still had to decide what evidence was strong
+  enough to keep or drop an experiment.
 
-```python
-def predict(request: dict) -> float:
-    """
-    Input:  {
-        "pickup_zone":     int,   # NYC taxi zone, 1-265
-        "dropoff_zone":    int,
-        "requested_at":    str,   # ISO 8601 datetime
-        "passenger_count": int
-    }
-    Output: predicted trip duration in seconds (float)
-    """
+Total time spent on this challenge: 2 hours 
+
+## Final Score
+
+Dev MAE: **267.940 seconds**
+
+Other validation numbers:
+
+- `grade.py` 50k sample MAE: **270.0 seconds**
+- Dev holdout MAE: **273.987 seconds**
+- Docker image size: **943MB**
+- Docker build time: **69s**
+- `predict()` latency p99: **0.237ms**
+
+The Dev holdout is the last few days of Dev and is harder than the full Dev
+average, so I think it is the more honest number to keep in mind for Eval.
+
+## What I Built
+
+I started with the provided XGBoost baseline, but it performed worse than a
+simple lookup table. The reason is that taxi zone IDs are categorical labels.
+Zone `43` and zone `44` are not necessarily close just because their numbers
+are close.
+
+So I made the route itself the base signal:
+
+1. Compute historical duration for each `(pickup_zone, dropoff_zone)` pair.
+2. Add time-aware tables for `(pickup_zone, dropoff_zone, hour)` and
+   `(pickup_zone, dropoff_zone, day_of_week)`.
+3. Use this as a strong base prediction.
+4. Train XGBoost to predict only the remaining error.
+5. Add centroid distance between pickup/dropoff zones as one more feature.
+
+The final prediction is:
+
+```text
+route/time lookup prediction + XGBoost residual correction
 ```
 
-Packaged as a GitHub repo containing:
+## Experiment Timeline
 
-- `predict.py` exposing the function above
-- A `Dockerfile` that builds your submission in under 10 minutes
-- Your trained model weights (`model.pkl` or equivalent)
-- A `README.md` describing your approach
+| Step                          | Dev MAE  | What I learned                                  |
+|-------------------------------|---------:|-------------------------------------------------|
+| Starter XGBoost baseline      |   ~351s  | Raw zone IDs underfit route geography           |
+| Zone-pair mean lookup         | 301.220s | Route identity is the main signal               |
+| Zone-pair median lookup       | 296.896s | Median worked better for MAE                    |
+| Time-aware route lookup       | 272.666s | Hour-of-day matters a lot                       |
+| First residual XGBoost        | 269.479s | Residual modeling helped, but had leakage risk  |
+| OOF-clean residual XGBoost    | 269.605s | Slightly worse, but methodologically correct    |
+| Final distance residual model | 267.940s | Distance gave a small additional lift           |
 
-**Constraints:**
+The biggest jump came from the time-aware route lookup. The residual model and
+distance features helped after that, but the lookup was the foundation.
 
-- Inference ≤ 200 ms per request on CPU
-- Total Docker image ≤ 2.5 GB (the reference baseline builds to ~2.02 GB because xgboost pulls scipy/nccl)
-- No external API calls at inference time
+## Leakage Fix
 
----
+My first residual model used target-encoded route features computed from all
+training rows. That can leak a row's own target into its features.
 
-## The Data
+I fixed this with K-fold out-of-fold encoding. For each fold, I built the route
+statistics from the other folds, then encoded that fold using only those
+statistics. The final inference tables are rebuilt using all training data,
+which is safe because Eval rows are not part of training.
 
-We use **real public NYC Yellow Taxi trip records**.
+This changed the residual model from a slightly optimistic result to a cleaner
+one:
 
-- **Train**: 11.5 months of 2023 (~37M trips after cleaning)
-- **Dev**: last 2 weeks of 2023 (~1M trips, for your local scoring)
-- **Eval**: 50k trips from a held-out 2024 slice. Kept by us, never distributed. This is what we grade on.
+```text
+leaky residual XGBoost: 269.479s
+OOF-clean residual XGBoost: 269.605s
+```
 
-You download Train and Dev via `python data/download_data.py`. The schema lives in `data/schema.md`.
+## Distance Features
 
----
+I used the NYC taxi zone shapefile to compute pickup/dropoff centroid features
+and haversine distance.
 
-## Scoring
+One detail I was careful about: I computed polygon centroids in the shapefile's
+projected CRS first, then converted those centroid points to latitude/longitude.
+For missing centroid zones like `264` and `265`, I used `NaN` distance features
+instead of zero distance. Zero would incorrectly mean the pickup and dropoff are
+in the same place, while XGBoost can handle missing values.
 
-**Your score = Mean Absolute Error (MAE), in seconds, on the held-out Eval set.**
+I also tested bearing features, but the gain was only about `0.024s`, so I
+dropped them.
 
-Lower is better. We run your Docker image in a sandbox, stream eval requests through it, and compute MAE. One number, one leaderboard, no subjective judging.
+## Validation
 
-For reference, measured on the Dev set:
-
-| Approach | Dev MAE |
-|---|---|
-| Predict the global mean | ~580 s |
-| Zone-pair averages (10 lines, no ML) | ~300 s |
-| **GBT baseline (this repo, intentionally naive)** | **~350 s** |
-
-Use Dev as a self-check. Baseline scores ~351 s on Dev and ~367 s on
-Eval, a ~15 s gap because Eval is a held-out winter-holiday slice that
-skews slightly harder than Dev. Budget for a similar small loss when we
-grade on Eval. Beat the baseline by as much as you can. There's no
-posted target; we'll tell you how your number stacks up.
-
-You may notice the naive GBT baseline actually loses to a 10-line zone-pair
-lookup. That's not a bug in the starter; it's the first thing worth
-understanding before you start training anything fancy.
-
----
-
-## Submission
-
-- Send us the repo URL when your submission is something you'd put
-  your name on.
-- One submission per candidate. Do not share work with other candidates.
-
----
-
-## Rules
-
-- Use any open-source model, library, or dataset you like
-- Use any paid LLM API (Claude, GPT, Gemini) during development. We encourage it.
-- Your **final submission must not** make external API calls at inference time
-- Do not use the 2024 eval set anywhere in training
-- Do not use proprietary data from any ride-hailing company
-
----
-
-## Baseline Submission
+I ran both normal correctness checks and submission-path checks:
 
 ```bash
-git clone https://github.com/gobblecube-hiring/arena
-cd arena/eta-challenge-starter
-
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# ~500 MB download, one-time
-python data/download_data.py
-
-# Trains in ~5 min on a laptop CPU, writes model.pkl
-python baseline.py
-
-# Scores on Dev
+python -m pytest tests/
 python grade.py
+docker build -t eta-distance-model .
+docker run --rm -v "$(pwd)/data:/work" eta-distance-model /work/dev.parquet /work/preds.csv
 ```
 
-What's in the repo:
+Final validation:
 
-- `baseline.py`: a gradient-boosted tree on 6 features (pickup zone, dropoff zone, hour of day, day of week, month, passenger count). This is the bar to beat.
-- `predict.py`: the submission interface. Signature is fixed; internals are yours.
-- `grade.py`: the exact scoring logic we run. Validate locally before submitting.
-- `data/download_data.py`: fetches NYC TLC data and builds train/dev splits.
-- `Dockerfile`: reference build. Extend as needed.
-- `tests/test_submission.py`: smoke tests for the submission contract.
+- Tests: **12 passed**
+- `grade.py`: **270.0s MAE**
+- Docker wrote **1,230,911** predictions
+- Docker image size: **943MB**
+- Docker build time: **69s**
+- p99 prediction latency: **0.237ms**
 
-Your job is to ship something better than `baseline.py`.
+I also added a test that compares row-by-row `predict.py` output against the
+training-side prediction path on edge-heavy samples. That test caught a real
+feature-construction mismatch before submission, which I fixed.
 
----
+## What Did Not Work
 
-## FAQ
+- The starter XGBoost model with raw zone IDs was much worse than a simple route
+  lookup.
+- Plain mean lookup was worse than median lookup.
+- The first residual model had target-encoding leakage risk, so I replaced it
+  with OOF encoding.
+- Bearing features were too small/noisy to keep.
 
-**Is this hard?**
-Yes. The baseline is deliberately honest. Meaningfully beating it takes focus and good engineering judgment.
+## Known Limitations
 
-**What AI tooling should I use?**
-Whatever helps you ship. Claude Code is our in-house default and the
-fastest path we've seen on these challenges, but Cursor, Aider, Copilot,
-ChatGPT, direct API calls, or no LLM at all are all fine. The role is
-about shipping fast with AI pair-programming generally, not about any
-one tool. Your git history is part of the signal. We read commits, not
-just the final state. Real iteration with AI help looks different from a
-polished from-scratch dump.
+The model is still weakest on airport, unknown-zone, and outer-borough trips.
+The hidden Eval set is a 2024 winter-holiday slice, so airport and holiday
+traffic could be harder than average Dev.
 
-**I've never trained a deep learning model. Should I apply?**
-Yes. The baseline is CPU-only and you can beat it without a neural network. Solid feature engineering and a tabular model will get you a meaningful improvement. The strongest approaches to this type of problem typically use deep learning, though, so the strongest entries usually pick it up along the way. That's the point of the challenge.
+The model also uses straight-line centroid distance, not actual road distance.
+It does not use weather, holidays, events, or live traffic.
 
-**What if I don't have access to a GPU?**
-You can submit a valid entry without one. The baseline is CPU-only. Strong submissions may require GPU training, though, and free-tier notebook environments (Kaggle, Colab, Lightning.ai) each offer ~30 GPU-hours per week, which has typically been enough. More detail in §6.3.
+## Next Experiments
 
-**What do you actually care about?**
-Your final score, your README, and your git log, roughly in that order. A clean submission with a thoughtful write-up will beat a slightly better score with no explanation.
+If I kept going, I would try:
 
-**Can I collaborate with a friend?**
-No. Individual submissions only.
+1. Pair-hour speed features, such as route duration divided by centroid distance.
+2. Holiday and holiday-window features for the winter Eval shift.
+3. Airport-specific correction features.
+4. Road-network distance using OSRM/OpenStreetMap instead of straight-line
+   distance.
+5. Offline weather features from NOAA.
 
-**What order do I run things in?**
+## Reproduce
 
-1. `python data/download_data.py` (one-time, ~500 MB)
-2. `python baseline.py` (produces `model.pkl`)
-3. `python grade.py` (validates on Dev, prints MAE)
-4. `docker build -t my-eta .` (packages for submission)
-5. `docker run --rm -v $(pwd)/data:/work my-eta /work/dev.parquet /work/preds.csv` (test grader pathway)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-train.txt
+python data/download_data.py
 
----
+python train_route_model.py --train-clean-xgb --clean-mode oof --distance --sample-n 5000000 --oof-folds 5
 
-## 6. Resources
+python -m pytest tests/
+python grade.py
 
-### 6.1 Libraries we've seen work well
-`pandas`, `numpy`, `polars`, `scikit-learn`, `xgboost`, `lightgbm`, `torch`, `transformers`, `pytorch-lightning`, `geopandas`, `osrm-backend`.
+docker build -t eta-distance-model .
+docker run --rm -v "$(pwd)/data:/work" eta-distance-model /work/dev.parquet /work/preds.csv
+```
 
-### 6.2 Datasets you may find useful
-- NYC TLC trip records (included via `download_data.py`)
-- NYC taxi zone shapefile (for centroid coords): https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip
-- NOAA hourly weather for JFK/LGA/NYC: https://www.ncei.noaa.gov/access/services/data/v1
-- OpenStreetMap road network for NYC (free)
 
-### 6.3 Compute
-
-The baseline trains in about 5 minutes on a laptop CPU. You do not need a GPU to submit a valid entry.
-
-Deep-learning approaches benefit substantially from GPU training.
-
-If you don't have one: free-tier notebook environments (Kaggle, Colab, Lightning.ai) each offer ~30 GPU-hours per week, which has typically been enough compute. How you use that compute is part of the test.
-
-### 6.4 Things that will disqualify you
-- Using the 2024 eval set during training
-- Submitting something that does not run in our sandbox
-- Hardcoding per-request predictions (we fuzz requests)
-- Scraping a real ride-hailing company's API
-
----
-
-## What We Actually Care About
-
-We are **not** hiring a specialist ride-hailing ML engineer. We don't run a ride-hailing company. We use this problem because it's well-defined, has open data, and is outside our business.
-
-What we're hiring for: **an engineer who can pick up a problem they've never seen before, pair effectively with modern AI tooling, and ship something that works.** The ETA problem is just an excuse to watch you do that.
-
-Your submission tells us three things:
-
-1. **Do you ship?** The number on the leaderboard.
-2. **Can you learn fast?** Your git log shows the trajectory. First commits usually look nothing like final commits.
-3. **Can you reason about a problem that isn't handed to you as a spec?** Your README explains what you tried, what failed, and what the next experiment would be if you kept going.
-
-You don't need an ML background to do well here. The difference is rarely background. It's almost always mindset.
-
-Good luck. We're excited to see what you ship.
-
----
-
-*Submit your repo URL and LinkedIn profile to agentic-hiring@gobblecube.ai. Questions welcome at the same address.*
